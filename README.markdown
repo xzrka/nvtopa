@@ -143,6 +143,14 @@ device are reported. Where a sensor answers with nothing, an offset the controll
 does not implement or a converter with no thermistor wired to it, the field says
 `N/A` rather than a temperature that only looks like one.
 
+`VRAM` has a second source, for the boards the GDDR registers carry nothing for: an
+accelerator that stacks HBM reports the temperature of its memory through the field
+`NVML_FI_DEV_MEMORY_TEMP` (82) of NVML, which is a supported API and needs no BAR of
+the card. A GeForce answers that field with *Not Supported*, so a device is asked once
+and the answer is kept, and a machine of GeForces pays one NVML call for its lifetime.
+Those accelerators have no live junction sensor in anything the driver publishes, so
+`JCT` stays `N/A` on them, as it does on a GeForce with nothing wired to its junction.
+
 Mapping those registers needs read access to the BAR0 of the GPU, which by default
 only the super user has, so under a plain user account the two fields are absent
 and a message says so at startup. That access does not need the super user though,

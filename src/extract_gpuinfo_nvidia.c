@@ -105,6 +105,17 @@ typedef struct nvmlFieldValue_st {
 #define NVML_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL 160
 #endif
 
+// The temperature of the memory of the board (from nvml.h). The GDDR6, GDDR6X and
+// GDDR7 sensors are registers of the memory controller, not this field: on a board
+// that stacks HBM there is nothing at those registers, and this field is the only
+// source its memory temperature has. A GeForce answers it with "not supported".
+#ifndef NVML_FI_DEV_MEMORY_TEMP
+#define NVML_FI_DEV_MEMORY_TEMP 82
+#endif
+
+// The ceiling of a memory sensor, the one the GDDR registers use as well.
+#define NVML_MEMORY_TEMP_MAX_C 127u
+
 // Init and shutdown
 
 static nvmlReturn_t (*nvmlInit)(void);
@@ -613,6 +624,23 @@ nvmlReturn_t (*nvmlDeviceGetProcessUtilization)(nvmlDevice_t device, nvmlProcess
                                                 unsigned int *processSamplesCount,
                                                 unsigned long long lastSeenTimeStamp);
 
+// What a device answers to NVML's memory temperature field. A board whose memory
+// temperature is unreadable right now and a board that has no such sensor are
+// different answers: one is asked again, the other never.
+typedef enum {
+  nvidia_memory_temp_answered,    // a temperature, written to *celsius
+  nvidia_memory_temp_unreadable,  // the sensor is there and answered nothing usable
+  nvidia_memory_temp_unsupported, // this board and driver answer nothing at all
+} nvidia_memory_temp_answer;
+
+// What one device has answered that field so far, so that a GeForce is asked once
+// and a datacenter board is asked on every refresh.
+typedef enum {
+  nvidia_memory_temp_unasked,
+  nvidia_memory_temp_reported,
+  nvidia_memory_temp_unavailable,
+} nvidia_memory_temp_state;
+
 struct gpu_info_nvidia {
   struct gpu_info base;
   struct list_head allocate_list;
@@ -659,6 +687,11 @@ struct gpu_info_nvidia {
   nvidia_vram_temps *vram_temps;
   enum gpu_extra_temps_support extra_temps_support;
   bool extra_temps_resolved;
+
+  // The memory temperature of a board that reports it to NVML: the accelerators
+  // that stack HBM, whose memory is wired to none of the GDDR registers. The first
+  // answer is kept, like the NVLink probe, so a GeForce is not asked every refresh.
+  nvidia_memory_temp_state memory_temp_nvml;
 };
 
 static LIST_HEAD(allocations);
@@ -678,6 +711,12 @@ static void nvlink_refresh_cached_info(struct gpu_info_nvidia *gpu_info, unsigne
 // Maps the junction and memory temperature registers of one GPU, once, and keeps
 // the outcome whether it worked or not (defined with the other sensors below).
 static void nvidia_setup_vram_temps(struct gpu_info_nvidia *gpu_info);
+
+// The memory temperature of a board whose memory temperature is not in the GDDR
+// registers, read from the field NVML reports it in (defined below, with the other
+// sensors).
+static nvidia_memory_temp_answer nvidia_query_memory_temp_nvml(nvmlDevice_t device, unsigned int *celsius);
+static bool nvidia_read_memory_temp_nvml(struct gpu_info_nvidia *gpu_info, unsigned int *celsius);
 
 // Remap raw NVML NVLink protocol version to the marketing version (forward declaration)
 static unsigned int nvlink_marketing_version(unsigned int raw_version);
@@ -1259,12 +1298,15 @@ static void gpuinfo_nvidia_refresh_dynamic_info(struct gpu_info *_gpu_info) {
   nvidia_setup_vram_temps(gpu_info);
   unsigned int junction_temp = NVTOP_TEMPERATURE_INVALID;
   unsigned int vram_temp = NVTOP_TEMPERATURE_INVALID;
-  if (nvidia_vram_temps_read(gpu_info->vram_temps, &junction_temp, &vram_temp)) {
-    if (junction_temp != NVTOP_TEMPERATURE_INVALID)
-      SET_GPUINFO_DYNAMIC(dynamic_info, junction_temp, junction_temp);
-    if (vram_temp != NVTOP_TEMPERATURE_INVALID)
-      SET_GPUINFO_DYNAMIC(dynamic_info, vram_temp, vram_temp);
-  }
+  nvidia_vram_temps_read(gpu_info->vram_temps, &junction_temp, &vram_temp);
+  // The memory of a board that stacks HBM is wired to none of the GDDR registers:
+  // its temperature is in the field of NVML, and that field is all it has.
+  if (vram_temp == NVTOP_TEMPERATURE_INVALID)
+    (void)nvidia_read_memory_temp_nvml(gpu_info, &vram_temp);
+  if (junction_temp != NVTOP_TEMPERATURE_INVALID)
+    SET_GPUINFO_DYNAMIC(dynamic_info, junction_temp, junction_temp);
+  if (vram_temp != NVTOP_TEMPERATURE_INVALID)
+    SET_GPUINFO_DYNAMIC(dynamic_info, vram_temp, vram_temp);
 
   // Device power usage
   last_nvml_return_status = nvmlDeviceGetPowerUsage(device, &dynamic_info->power_draw);
@@ -1873,12 +1915,84 @@ static bool device_may_have_vram_sensors(unsigned int architecture) {
   return true;
 }
 
+// The memory temperature of a board, from the field NVML reports it in: the HBM an
+// accelerator stacks, whose temperature is in no register of the GDDR layouts the
+// two temperatures above come from. Asking is one NVML call; a GeForce, which has
+// nothing to answer with, is asked once and never again.
+static nvidia_memory_temp_answer nvidia_query_memory_temp_nvml(nvmlDevice_t device, unsigned int *celsius) {
+  if (!nvmlDeviceGetFieldValues)
+    return nvidia_memory_temp_unsupported;
+
+  // The driver fills in the type, the return code of this one field, and the value.
+  nvmlFieldValue_t field = {.fieldId = NVML_FI_DEV_MEMORY_TEMP};
+  nvmlReturn_t ret = nvmlDeviceGetFieldValues(device, 1, &field);
+
+  // "Not supported" is the answer of a board with no such sensor, given on the call
+  // or on the field. Anything else — a device being reset, a driver that is busy —
+  // is a reason to ask again, not a reason to stop believing the sensor exists.
+  if (ret == NVML_ERROR_NOT_SUPPORTED)
+    return nvidia_memory_temp_unsupported;
+  if (ret != NVML_SUCCESS)
+    return nvidia_memory_temp_unreadable;
+
+  if (field.nvmlReturn == NVML_ERROR_NOT_SUPPORTED)
+    return nvidia_memory_temp_unsupported;
+  if (field.nvmlReturn != NVML_SUCCESS)
+    return nvidia_memory_temp_unreadable;
+
+  // The degrees of the memory, in whichever type the driver carries the field.
+  long long degrees = 0;
+  switch (field.valueType) {
+  case NVML_VALUE_TYPE_SIGNED_INT:
+    degrees = field.value.siVal;
+    break;
+  case NVML_VALUE_TYPE_UNSIGNED_INT:
+    degrees = field.value.uiVal;
+    break;
+  case NVML_VALUE_TYPE_DOUBLE:
+    degrees = (long long)field.value.dVal;
+    break;
+  default:
+    return nvidia_memory_temp_unreadable;
+  }
+
+  // The answers that are no temperature: a sensor with nothing to report says 0,
+  // and no memory in a working machine sits at the freezing point of water.
+  if (degrees <= 0 || (unsigned long long)degrees > NVML_MEMORY_TEMP_MAX_C)
+    return nvidia_memory_temp_unreadable;
+
+  *celsius = (unsigned int)degrees;
+  return nvidia_memory_temp_answered;
+}
+
+// The same field, with the answer of each device remembered: a GeForce pays one
+// NVML call for its whole lifetime, a datacenter board one per refresh.
+static bool nvidia_read_memory_temp_nvml(struct gpu_info_nvidia *gpu_info, unsigned int *celsius) {
+  if (gpu_info->memory_temp_nvml == nvidia_memory_temp_unavailable)
+    return false;
+
+  nvidia_memory_temp_answer answer = nvidia_query_memory_temp_nvml(gpu_info->gpuhandle, celsius);
+
+  if (gpu_info->memory_temp_nvml == nvidia_memory_temp_unasked && answer == nvidia_memory_temp_unsupported)
+    gpu_info->memory_temp_nvml = nvidia_memory_temp_unavailable;
+
+  return answer == nvidia_memory_temp_answered;
+}
+
 static void nvidia_setup_vram_temps(struct gpu_info_nvidia *gpu_info) {
   if (gpu_info->extra_temps_resolved)
     return;
 
   gpu_info->extra_temps_resolved = true;
   gpu_info->extra_temps_support = gpu_extra_temps_none;
+
+  // The registers are not the only source there is. A board whose memory temperature
+  // NVML knows — an accelerator with HBM — has a temperature to show with no BAR to
+  // map, so it is asked here, where the answer does not depend on the permission the
+  // block below needs.
+  unsigned int memory_temp = NVTOP_TEMPERATURE_INVALID;
+  if (nvidia_read_memory_temp_nvml(gpu_info, &memory_temp))
+    gpu_info->extra_temps_support = gpu_extra_temps_available;
 
   if (!nvmlDeviceGetPciInfo)
     return;
@@ -1902,9 +2016,11 @@ static void nvidia_setup_vram_temps(struct gpu_info_nvidia *gpu_info) {
     gpu_info->extra_temps_support = gpu_extra_temps_available;
     break;
   // The registers exist for this board but may not be mapped, which is the answer
-  // a plain user gets and the one worth telling the user about
+  // a plain user gets and the one worth telling the user about. A board the field
+  // above already answers for keeps its field: the registers are not all it has.
   case nvidia_vram_temps_no_access:
-    gpu_info->extra_temps_support = gpu_extra_temps_no_permission;
+    if (gpu_info->extra_temps_support == gpu_extra_temps_none)
+      gpu_info->extra_temps_support = gpu_extra_temps_no_permission;
     break;
   case nvidia_vram_temps_unsupported:
   case nvidia_vram_temps_no_bar0:
