@@ -1,513 +1,196 @@
-NVTOP
-=====
+# nvtopa
 
-What is NVTOP?
---------------
+English | [한국어](README.ko.markdown) | [中文](README.zh.markdown) | [日本語](README.ja.markdown)
 
-NVTOP stands for Neat Videocard TOP, a (h)top like task monitor for GPUs and
-accelerators. It can handle multiple GPUs and print information about them in a
-htop-familiar way.
+A fork of [syllo/nvtop](https://github.com/syllo/nvtop) focused on **temperature
+instrumentation** and a **device header that never gets cut off**, no matter how
+narrow the terminal is.
 
-Currently supported vendors are AMD (Linux amdgpu driver), Apple (limited M1 &
-M2 support), Huawei (Ascend), Intel (Linux i915/Xe drivers), NVIDIA (Linux
-proprietary divers), Qualcomm Adreno (Linux MSM driver), Broadcom VideoCore (Linux v3d driver),
-Rockchip, MetaX (MXSML driver), Enflame (Linux EFML driver), Tenstorrent (Linux tt-kmd driver).
-Rockchip, MetaX (MXSML driver), Enflame (Linux EFML driver), Iluvatar CoreX (ixML / libixml).
+![nvtopa main view](screenshot/nvtopa_main.png)
 
-Because a picture is worth a thousand words:
+---
 
-![NVTOP interface](/screenshot/NVTOP_ex1.png)
+## Table of Contents
 
-Table of Contents
------------------
-
-- [NVTOP Options and Interactive Commands](#nvtop-options-and-interactive-commands)
-  - [Interactive Setup Window](#interactive-setup-window)
-  - [Saving Preferences](#saving-preferences)
-  - [NVTOP Manual and Command line Options](#nvtop-manual-and-command-line-options)
-- [GPU Support](#gpu-support)
-  - [AMD](#amd)
-  - [Intel](#intel)
-  - [NVIDIA](#nvidia)
-  - [Adreno](#adreno)
-  - [Apple](#apple)
-  - [Ascend](#ascend) (only tested on 910B)
-  - [Iluvatar CoreX](#iluvatar-corex)
-  - [VideoCore](#videocore)
-  - [Rockchip](#rockchip)
-  - [MetaX](#metax)
-  - [Enflame](#enflame)
-  - [Tenstorrent](#tenstorrent)
-- [Build](#build)
-- [Distribution Specific Installation Process](#distribution-specific-installation-process)
-  - [Ubuntu / Debian](#ubuntu--debian)
-    - [Ubuntu Impish (21.10) / Debian buster (stable) and more recent (stable)](#ubuntu-impish-2110-debian-buster-stable-and-more-recent)
-  - [Fedora / Red Hat / CentOS](#fedora--red-hat--centos)
-  - [OpenSUSE](#opensuse)
-  - [Arch Linux](#arch-linux)
-  - [Gentoo](#gentoo)
-  - [AppImage](#appimage)
-  - [Snap](#snap)
-  - [Conda-forge](#conda-forge)
-  - [Docker](#docker)
-  - [WSL2](#wsl2)
-- [NVTOP Build](#nvtop-build)
-- [Troubleshoot](#troubleshoot)
+- [What this fork adds](#what-this-fork-adds)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Screenshots](#screenshots)
+- [Test environment](#test-environment)
+- [Build and install](#build-and-install)
+- [Documentation](#documentation)
 - [License](#license)
 
-NVTOP Options and Interactive Commands
---------------------------------------
-### Interactive Setup Window
+## What this fork adds
 
-NVTOP has a builtin setup utility that provides a way to specialize the interface to your needs.
-Simply press ``F2`` and select the options that are the best for you.
+### 1. Width-adaptive device header
 
-In the ``Chart`` section you can choose which metrics are plotted, including GPU and memory
-utilization, temperature, power, clocks, and the **PCIe RX / TX load** (the receive and transmit
-throughput as a percentage of the maximum link bandwidth).
-
-![NVTOP Setup Window](/screenshot/Nvtop-config.png)
-
-### Saving Preferences
-
-You can save the preferences set in the setup window by pressing ``F12``.
-The preferences will be loaded the next time you run ``nvtop``.
-
-### NVTOP Manual and Command line Options
-
-NVTOP comes with a manpage!
-```bash
-man nvtop
-```
-For quick command line arguments help
-```bash
-nvtop -h
-nvtop --help
-```
-
-GPU Support
------------
-
-### AMD
-
-NVTOP supports AMD GPUs using the `amdgpu` driver and the legacy `radeon` driver (legacy GPUs, limited support) through the exposed DRM and
-sysfs interface.
-
-The radeon provides limited metrics compared to amdgpu.
-
-AMD introduced the fdinfo interface in kernel 5.14 ([browse kernel
-source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c?h=linux-5.14.y)).
-Hence, you will need a kernel with a version greater or equal to 5.14 to see the
-processes using AMD GPUs.
-
-Support for recent GPUs are regularly mainlined into the linux kernel, so please
-use a recent-enough kernel for your GPU.
-
-### Intel
-
-NVTOP supports Intel GPUs using the `i915` or `xe` linux driver.
-
-Intel introduced the fdinfo interface in kernel 5.19 ([browse kernel
-source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/i915/i915_drm_client.c?h=linux-5.19.y)).
-Hence, you will need a kernel with a version greater or equal to 5.19 to see the
-processes using Intel GPUs.
-
-Intel requires CAP_PERFMON or CAP_SYS_ADMIN capabilities to access the total memory usage, and an accurate GPU frequency.
-you can run `sudo setcap cap_perfmon=ep $(which nvtop)` to grant the necessary permissions or run nvtop as root.
-
-### NVIDIA
-
-The *NVML library* does not support some of the queries for GPUs coming before the
-Kepler microarchitecture. Anything starting at GeForce 600, GeForce 800M and
-successor should work fine. For more information about supported GPUs please
-take a look at the [NVML documentation](http://docs.nvidia.com/deploy/nvml-api/nvml-api-reference.html#nvml-api-reference).
-
-The extra GPU info bar (`nvtop -i`) shows the dynamic parameters NVML does not
-report, such as the XBAR, SYS and NVD clocks, and `nvtop -X` also shows the
-static specs (shader cores, L2 cache, execution engines) and the secondary HUB,
-HOST, DISP, MSD and UTILS clocks. The clock domains are read through the *NvAPI
-library* (`libnvidia-api.so.1`) that recent drivers install alongside NVML;
-without it the rest of the interface is unaffected and the bar takes no room on
-a GPU that reports nothing.
-
-The two temperatures on the device header besides `TEMP`, `JCT` (the memory
-junction, also called hot spot) and `VRAM` (the memory devices), come from
-registers of the GDDR6/GDDR6X/GDDR7 memory controller that no supported API
-reports. They are worth watching because the core temperature is the die reporting
-on itself while the memory runs hotter, and on these boards the memory is what the
-fan curve is really protecting. The offsets are those of Ampere and later, the
-generations the layouts were measured on; older boards, Turing with its GDDR6
-included, have something else at those addresses that decodes into a temperature no
-one would suspect, and are left alone. Only the hottest junction channel and the hottest memory
-device are reported. Where a sensor answers with nothing, an offset the controller
-does not implement or a converter with no thermistor wired to it, the field says
-`N/A` rather than a temperature that only looks like one.
-
-`VRAM` has a second source, for the boards the GDDR registers carry nothing for: an
-accelerator that stacks HBM reports the temperature of its memory through the field
-`NVML_FI_DEV_MEMORY_TEMP` (82) of NVML, which is a supported API and needs no BAR of
-the card. A GeForce answers that field with *Not Supported*, so a device is asked once
-and the answer is kept, and a machine of GeForces pays one NVML call for its lifetime.
-Those accelerators have no live junction sensor in anything the driver publishes, so
-`JCT` stays `N/A` on them, as it does on a GeForce with nothing wired to its junction.
-
-Mapping those registers needs read access to the BAR0 of the GPU, which by default
-only the super user has, so under a plain user account the two fields are absent
-and a message says so at startup. That access does not need the super user though,
-only permission on one file: the registers are reached through
-`/sys/bus/pci/devices/*/*/resource0`, and the kernel path that maps it,
-`pci_mmap_resource()` in `drivers/pci/pci-sysfs.c` and `pci_mmap_resource_range()`
-in `drivers/pci/mmap.c`, asks for no capability of its own. The `0600 root:root`
-mode of that file is the whole of the gate, so a udev rule handing it to a group,
-read only, is enough:
+Upstream nvtop lays the device header out at a fixed width of roughly 120
+columns, so on a typical terminal the power, fan and clock fields simply run
+off the right edge. This fork fits the header to the console before the layout
+is computed, by walking a fixed **give-up ladder**: the fan padding, the clock
+labels, the ECC and NVLink fields and finally the min/max readouts are dropped
+one after another until the row fits. The core temperature is never dropped
+entirely.
 
 ```
-# /etc/udev/rules.d/99-nvtop-gpu-bars.rules
-# The memory temperatures of an NVIDIA GPU are registers in its first BAR, read for
-# the members of gpuview instead of only for root. Read only, so the registers may
-# not be written through it.
-ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x03*", \
-  RUN+="/bin/chgrp gpuview /sys%p/resource0", RUN+="/bin/chmod 0440 /sys%p/resource0"
+Device 1 [NVIDIA GeForce RTX 3090] PCIe GEN 4@16x   NVL3 4x 0.000 KiB/s
+1455MHz 9501MHz  TEMP  63° 46/66   JCT  74°C   VRAM  74°C   FAN  59%  POW 215 / 220 W
 ```
 
-The resource files of a PCI device are created when a driver binds it, later than
-the add event of the device itself, so a rule can find no file to set: run the same
-two commands again once the driver is up, and after every reload of it. Where the
-driver has claimed the region exclusively the mapping answers `EBUSY`, and there
-`sudo nvtop` has it; the `/dev/mem` of those boards needs `iomem=relaxed` on the
-kernel command line, which is a wider door than the group above.
+Verified by a pty sweep that nothing is cut off anywhere between **40 and 200
+columns**.
 
-The register layouts and their decodings are ported from
-[gddr6-core-junction-vram-temps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps),
-which credits the measurements of olealgoritme, jjziets, igor'sLAB and
-sunnyyangyangyang. Reading undocumented registers is what it is: the values are
-reported as they read, without warranty.
+### 2. Session min/max temperatures, with a reset key
 
-### Adreno
+`TEMP`, `JCT` and `VRAM` each show the current reading plus the minimum and
+maximum seen since the program started (or since the last reset):
 
-NVTOP supports Adreno GPUs using the `msm` linux driver.
+- `TEMP 63° 46/66` — now 63 °C, minimum 46 °C, maximum 66 °C
+- Press **F7** to reset the history; the min/max values collapse to the
+  current reading and re-track from there.
 
-msm introduced the fdinfo interface in kernel 6.0 ([browse kernel
-source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/msm/msm_drv.c?h=linux-6.0.y)).
-Hence, you will need a kernel with a version greater or equal to 6.0 to see the
-processes using Adreno GPUs.
+The min/max values survive a terminal resize, because they live with the
+device state rather than with the terminal windows.
 
-### Apple
+### 3. NVLink throughput beside the PCIe one
 
-NVTOP includes some initial support for Apple using Metal. This is only supported when building for Apple, and when building for Apple only this vendor is supported.
+The NVLink transfer rate moved from the end of the second header line, where it
+was the first thing a narrow terminal cut off, to **line 1, right after the
+PCIe throughput**:
 
-**APPLE SUPPORT STATUS**
-- Apple support is still being worked on. Some bugs and limitations may apply.
+```
+Device 1 [NVIDIA GeForce RTX 3090] PCIe GEN 4@16x   NVL3 4x 0.000 KiB/s
+```
 
-### Ascend
+The PCIe field is right-sized to the shape it actually draws — the verbose
+`PCIe GEN 4@16x RX: ... TX: ...` (46 columns), an abbreviated
+`GEN 4@16x RX 9.2G/TX 10.1G` (30), or just `PCIe GEN 4@16x` (14) — so the NVLink
+field sits snugly after it instead of after a run of blanks. When the room is
+gone entirely, below roughly 60 columns, NVLink is dropped and PCIe gets the
+space back. A board without a bridge keeps a blank slot, exactly as it did
+before.
 
-NVTOP supports Ascend through the DCMI API (tested on 910B3 hardware). It
-uses the logical-device API when available and falls back to the legacy
-card/device API. Read-only telemetry is reported when supported by the
-installed driver; unavailable values remain unset. Enable it with
-`-DASCEND_SUPPORT=ON`, and set `-DASCEND_ROOT=/path/to/Ascend` when CANN is
-installed outside the standard locations.
+### 4. The original power format at every width
 
-### Iluvatar CoreX
+Upstream degrades `POW x / y W` (draw / max) to a bare `POW x W` on narrow
+terminals; this fork keeps the original draw-and-max format everywhere and
+drops the field only when there is nothing left to give.
 
-NVTOP supports Iluvatar CoreX GPUs through the ixML library.
+### 5. Up to ten plot lines per GPU
 
-The backend dynamically loads `libixml.so` from `/usr/local/corex/lib`,
-`/usr/local/corex/lib64`, or the default dynamic loader search path. The ixML
-runtime exposes an NVML-compatible API surface used by NVTOP to query device,
-power, PCIe, clock, temperature, memory, and process information.
+The per-GPU chart accepts up to 10 metrics at once (upstream allows 4). The
+default draws **all of them in one chart per device**, each in its own color:
 
-### VideoCore
+- GPU utilization rate
+- GPU memory utilization rate
+- GPU core temperature
+- memory junction temperature
+- memory (VRAM) temperature
 
-NVTOP supports VideoCore (testing on raspberrypi 4B).
+A line for a sensor the board does not report is skipped automatically — an
+RTX 3050 has no memory-temperature sensor, so it draws no `vram(c)` line.
 
-Supports GPU frequency, temperature, utilization, per-process utilization, GPU memory usage, and H264 decoding utilization.
+### 6. F8 — cycle the graph contents
 
-On non-raspberry pi os, you need to use the `linux-rpi 6.12.y` kernel and above, and ensure the presence of the `/dev/vcio` device.
+One chart per device shows different metrics depending on the mode; **F8**
+cycles through them and empties the plot buffers so the modes never mix:
 
-### Rockchip
+| mode | lines drawn |
+| --- | --- |
+| all metrics (default) | utilization, mem utilization and every reported temperature |
+| original nvtop | GPU utilization and memory utilization only |
+| temperatures only | core, junction and memory temperature only |
 
-NVTOP supports Rockchip (testing on orangepi 5 plus).
+### 7. Memory junction and VRAM temperatures from GDDR registers
 
-Supports NPU frequency, temperature, utilization.
+The fork's original feature, inherited from
+[ThomasBaruzier/gddr6-core-junction-vram-temps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps):
+`JCT` (memory junction, also called hot spot) and `VRAM` (the memory devices)
+are read from registers of the GDDR6/GDDR6X/GDDR7 memory controller that no
+supported API reports. Ampere (RTX 30) and later boards only; anything older is
+left alone. An ordinary user can read them after a udev rule hands the first
+BAR of the GPUs to a group — see the [machine-setup
+repository](https://github.com/xzrka/nvtopa-setup) for the script that does it.
 
-### MetaX
+## Keyboard shortcuts
 
-NVTOP supports MetaX (testing on MXC500) by MXSML LIBRARY.
+| key | action |
+| --- | --- |
+| `F2` | interactive setup window (Chart page configures plot lines and their colors) |
+| `F6` | sort the process list |
+| `F7` | **reset the temperature history** (min/max) |
+| `F8` | **cycle the graph contents** (all metrics → original nvtop → temperatures only) |
+| `F9` | kill a process |
+| `F10` | quit |
+| `F12` | save preferences |
+| `Ctrl+L` | force a full repaint |
 
-For more information about GPUs please take a look at the [METAX documentation](https://developer.metax-tech.com/doc/index)
+## Screenshots
 
-### Enflame
+Main view on three NVIDIA GPUs — width-adaptive header with min/max
+temperatures, NVLink beside PCIe, and a five-line chart per device:
 
-NVTOP supports Enflame GCUs (testing on Enflame S60, Enflame L300 and Enflame L600) by EFML LIBRARY
+![nvtopa main view](screenshot/nvtopa_main.png)
 
-GCU, which refers to General Compute Unit, is a type of accelerator card that is used to perform general-purpose computing tasks just like GPGPU.
+The setup window (`F2`), from where the Chart page turns individual plot lines
+on and off and cycles their colors:
 
-### Tenstorrent
+![nvtopa setup window](screenshot/nvtopa_setup.png)
 
-NVTOP supports Tenstorrent AI accelerators (Blackhole, Wormhole, Grayskull) through the [tt-kmd](https://github.com/tenstorrent/tt-kmd) kernel driver.
+## Test environment
 
-Supports temperature, power draw, AI clock, fan RPM, PCIe link info, and process listing. No external libraries required -- all data is read from sysfs, hwmon, and procfs.
+The fork is developed and verified on this machine:
 
-Build
------
+| item | value |
+| --- | --- |
+| GPUs | 1 × NVIDIA GeForce RTX 3050 (GDDR6, no memory-temperature sensor), 2 × NVIDIA GeForce RTX 3090 (GDDR6X, NVLink-paired as NVL3 4x) |
+| OS | Pop!_OS (Ubuntu-based), Linux x86-64 |
+| driver | NVIDIA proprietary driver (NVML + BAR0 register access) |
+| terminal | GNOME Terminal; headless verification through a pty harness |
 
-Several libraries are required in order for NVTOP to display GPU info:
+Verification:
 
-* The *ncurses* library driving the user interface.
-  * This makes the screen look beautiful.
-* For NVIDIA: the *NVIDIA Management Library* (*NVML*) which comes with the GPU driver.
-  * This queries the GPU for info.
-  * The *NvAPI library* (`libnvidia-api.so.1`), also from the driver, is used
-    when present for the clock domains NVML does not report. It is optional.
-* For AMD: the libdrm library used to query AMD GPUs through the kernel driver.
-* For METAX: the *MetaX System Management Library* (*MXSML*) which comes with the GPU driver.
-  * This queries the GPU for info.
-* For Enflame: the *Enflame Management Library* (*EFML*) which comes with the GCU driver.
-* For Iluvatar CoreX: the *ixML* runtime library (`libixml.so`) which comes with the driver.
-  * This backend loads the library dynamically at runtime.
+- **`tests/temp_colors.py`** — replays the program in a pty and extracts the
+  SGR color in effect over every `TEMP` / `JCT` / `VRAM` digit, so the color
+  coding of the temperature fields is checked automatically. Run with
+  `python3 tests/temp_colors.py 80 24 -- ./build/src/nvtop`.
+- **`tests/pty_capture.py`** — runs the program in a pty of any size and
+  prints the screen; used to sweep the header from 40 to 200 columns and to
+  verify the give-up ladder at each width.
+- **`ctest`** — the upstream test suite plus `nvidia_vram_temps`, which stands
+  the sensor registers up in a fake sysfs and checks the decoded readings.
+- **`tests/interfaceTests.cpp`** — unit tests of the PCIe bandwidth table.
+- A manual pty sweep at **40, 50, 60, 70, 80, 90, 100, 120, 160 and 200
+  columns** confirms nothing is cut off and the power field keeps its
+  `POW x / y W` format everywhere; the three F8 graph modes and the F7 reset
+  were exercised both in the pty and live in GNOME Terminal.
 
-## Distribution Specific Installation Process
+## Build and install
 
-### Ubuntu / Debian
-
-If your distribution provides the snap utility, follow the [snap installation process](#snap) to obtain an up-to-date version of `nvtop`.
-
-A standalone application is available as [AppImage](#appimage).
-
-#### Ubuntu Focal (20.04), Debian buster (stable) and more recent
+Standard nvtop build:
 
 ```bash
-sudo apt install nvtop
+git clone https://github.com/xzrka/nvtopa.git
+cd nvtopa
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 ```
 
-#### Ubuntu PPA
-
-A [PPA supporting Ubuntu 20.04 and newer](https://launchpad.net/~quentiumyt/+archive/ubuntu/nvtop) is provided by
-[Quentin Lienhardt](https://github.com/QuentiumYT) that offers an up-to-date version of `nvtop`, enabled for NVIDIA, AMD and Intel.
-
-```bash
-sudo add-apt-repository ppa:quentiumyt/nvtop
-sudo apt install nvtop
-```
-
-#### Older
-
-- AMD and Intel Dependencies
-  ```bash
-  sudo apt install libdrm-dev libsystemd-dev
-  # Ubuntu 18.04
-  sudo apt install libudev-dev
-  ```
-
-- NVIDIA Dependency
-  - NVIDIA drivers (see [Ubuntu Wiki](https://help.ubuntu.com/community/BinaryDriverHowto/Nvidia) or [Ubuntu PPA](https://launchpad.net/~graphics-drivers/+archive/ubuntu/ppa) or [Debian Wiki](https://wiki.debian.org/NvidiaGraphicsDrivers#NVIDIA_Proprietary_Driver))
-
-- NVTOP Dependencies
-  - CMake, ncurses and Git
-  ```bash
-  sudo apt install cmake libncurses5-dev libncursesw5-dev git
-  ```
-
-- NVTOP
-  - Follow the [NVTOP Build](#nvtop-build)
-
-
-### Fedora / Red Hat / CentOS
-
-A standalone application is available as [AppImage](#appimage).
-
-#### Fedora 36 and newer
-
-- ```bash
-  sudo dnf install nvtop
-  ```
-
-#### Red Hat Enterprise Linux 8 and 9
-
-- ```bash
-  sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %{rhel}).noarch.rpm
-  sudo dnf install nvtop
-  ```
-
-#### CentOS Stream, Rocky Linux, AlmaLinux
-
-- ```bash
-  sudo dnf install -y epel-release
-  sudo dnf install nvtop
-  ```
-
-#### Build process for Fedora / Red Hat / CentOS:
-
-- AMD and Intel Dependencies
-  ```bash
-  sudo dnf install libdrm-devel systemd-devel
-  ```
-
-- NVIDIA Dependency
-  - NVIDIA drivers, **CUDA required for nvml libraries** (see [RPM Fusion](https://rpmfusion.org/Howto/NVIDIA))
-
-- NVTOP Dependencies
-  - CMake, ncurses, C++ and Git
-  ```bash
-  sudo dnf install cmake ncurses-devel git gcc-c++
-  ```
-
-- NVTOP
-  - Follow the [NVTOP Build](#nvtop-build)
-
-### OpenSUSE
-
-A standalone application is available as an [AppImage](#appimage).
-
-Build process for OpenSUSE:
-
-- AMD Dependency
-  ```bash
-  sudo zypper install libdrm-devel
-  ```
-
-- NVIDIA Dependency
-  - NVIDIA drivers (see [SUSE Support Database](https://en.opensuse.org/SDB:NVIDIA_drivers))
-
-- NVTOP Dependencies
-  - CMake, ncurses and Git
-    ```bash
-    sudo zypper install cmake ncurses-devel git
-    ```
-
-- NVTOP
-  - Follow the [NVTOP Build](#nvtop-build)
-
-### Arch Linux
-
-- ```bash
-  sudo pacman -S nvtop
-  ```
-
-### Gentoo
-
-- ```bash
-  sudo emerge -av nvtop
-  ```
-
-### AppImage
-
-An AppImage is a standalone application. Just download the AppImage, make it executable and run it!
-
-- Go to the [release page](https://github.com/Syllo/nvtop/releases/latest) and download `nvtop-x86_64.AppImage`
-
-- ```bash
-  # Go to the download location ** The path may differ on your system **
-  cd $HOME/Downloads
-  # Make the AppImage executable
-  chmod u+x nvtop-x86_64.AppImage
-  # Enjoy nvtop
-  ./nvtop-x86_64.AppImage
-  ```
-
-If you are curious how that works, please visit the [AppImage website](https://appimage.org/).
-
-### Snap
-
-- ```bash
-  snap install nvtop
-  # Add the capability to kill processes inside nvtop
-  snap connect nvtop:process-control
-  # Add the capability to inspect GPU information (fan, PCIe, power, etc)
-  snap connect nvtop:hardware-observe
-  # AMDGPU process list support (read /proc/<pid>)
-  snap connect nvtop:system-observe
-  # Temporary workaround to get per-process GPU usage (read /proc/<pid>/fdinfo)
-  snap connect nvtop:kubernetes-support
-  ```
-
-Notice: The connect commands allow
-
-### Conda-forge
-
-A [conda-forge feedstock for `nvtop`](https://github.com/conda-forge/nvtop-feedstock) is available.
-
-#### conda / mamba / miniforge
-
-```bash
-conda install --channel conda-forge nvtop
-```
-
-#### pixi
-
-```bash
-pixi global install nvtop
-```
-
-### Docker
-
-- NVIDIA drivers (same as above)
-
-- [nvidia-docker](https://github.com/NVIDIA/nvidia-docker) (See [Container Toolkit Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker))
-
-- ```bash
-  git clone https://github.com/Syllo/nvtop.git && cd nvtop
-  sudo docker build --tag nvtop .
-  sudo docker run -it --rm --runtime=nvidia --gpus=all --pid=host nvtop
-  ```
-
-### WSL2
-
-Nvtop support in WSL2 mostly boils down to GPU/Accelerator vendor support of
-WSL2. Nvtop should work out of the box for the following configurations:
-
-- NVIDIA: Please refer to [NVIDIA's user guide to get started with CUDA on
-WSL2](https://docs.nvidia.com/cuda/wsl-user-guide/index.html#getting-started-with-cuda-on-wsl)
-to avoid overiding the driver exposed by WSL2 (from Windows) with the NVIDIA
-Linux drivers.
-
-## NVTOP Build
-
-```bash
-git clone https://github.com/Syllo/nvtop.git
-mkdir -p nvtop/build && cd nvtop/build
-cmake .. -DNVIDIA_SUPPORT=ON -DAMDGPU_SUPPORT=ON -DINTEL_SUPPORT=ON
-make
-
-# Install globally on the system
-sudo make install
-
-# Alternatively, install without privileges at a location of your choosing
-# cmake .. -DNVIDIA_SUPPORT=ON -DAMDGPU_SUPPORT=ON -DINTEL_SUPPORT=ON -DCMAKE_INSTALL_PREFIX=/path/to/your/dir
-# make
-# make install
-```
-
-If you use **conda** as environment manager and encounter an error while building NVTOP, try `conda deactivate` before invoking `cmake`.
-
-The build system supports multiple build types (e.g. -DCMAKE_BUILD_TYPE=RelWithDebInfo):
-
-* Release: Binary without debug info
-* RelWithDebInfo: Binary with debug info
-* Debug: Compile with warning flags and address/undefined sanitizers enabled (for development purposes)
-
-Troubleshoot
-------------
-
-- The plot looks bad:
-  - Verify that you installed the wide character version of the ncurses library (libncurses**w**5-dev for Debian / Ubuntu), clean the build directory and restart the build process.
-- If `nvtop` exits with `ncurses: cannot initialize terminal type ($TERM="unknown")`, ensure that `$TERM` is set to a valid terminal type such as `xterm-256color`.
-- **Putty**: Tell putty not to lie about its capabilities (`$TERM`) by setting the field ``Terminal-type string`` to ``putty`` in the menu
-  ``Connection > Data > Terminal Details``.
-- `NO GPU to monitor.` for NVIDIA GPUs:
-  - `nvtop` loads a shared library named `libnvml.so` (shipped with the NVIDIA
-  drivers) to querry device information. If the library is not present, nvtop
-  will not be able to monitor your NVIDIA device.
-  - On `WSL2`, the installation instructions are slightly different since the
-  driver is being exposed by Windows to the virtual machine (see instruction
-  link in [the WSL2 section](#wsl2)). If you install the NVIDIA linux drivers
-  inside WSL2, you may encounter a version mismatch error or nvtop may silently
-  not work at all.
-
-License
--------
-
-NVTOP is licensed under the GPLv3 license or any later version.
-You will find a copy of the license inside the COPYING file of the repository or
-at the GNU website <[www.gnu.org/licenses/](http://www.gnu.org/licenses/)>.
+On the machine this fork is developed on, `install-nvtopa.sh` from the
+[machine-setup repository](https://github.com/xzrka/nvtopa-setup) builds the
+fork and installs it as `nvtopa`, next to the distribution's `nvtop`, and
+`unprivileged-temps.sh` sets up the udev rule that lets an ordinary user read
+the memory-temperature registers.
+
+## Documentation
+
+- [`docs/UPSTREAM_README.markdown`](docs/UPSTREAM_README.markdown) — the full
+  upstream documentation: vendor support, per-distribution installation,
+  troubleshooting.
+- Upstream project: <https://github.com/syllo/nvtop>
+- Machine setup (udev rule, installer, fake sysfs): <https://github.com/xzrka/nvtopa-setup>
+
+## License
+
+Same as upstream nvtop: BSD-3-Clause.
