@@ -483,7 +483,7 @@ static void draw_setup_window_chart(unsigned devices_count, struct list_head *de
     getyx(value_list_win, tmp, cur_col);
     mvwchgat(value_list_win, 0, cur_col, maxcols - cur_col, A_STANDOUT, green_color, NULL);
     wattr_set(value_list_win, A_NORMAL, magenta_color, NULL);
-    mvwprintw(value_list_win, 1, 0, "Maximum of 4 metrics per GPU");
+    mvwprintw(value_list_win, 1, 0, "Maximum of 10 metrics per GPU");
     wstandend(value_list_win);
 
     for (enum plot_information i = plot_gpu_rate; i < plot_information_count; ++i) {

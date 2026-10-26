@@ -61,16 +61,8 @@ static bool any_device_has_nvlink = false;
 // window allocation.
 static bool any_device_has_nvlink_active = false;
 
-// When NVLink has ACTIVE links, shrink fan field from 11 to 8 to make room on line 2.
-// Only done when there are actual links to show throughput for — 0-link "NVL3 0x"
-// display does not require any padding reduction.
-static void nvtop_adjust_field_sizes_for_nvlink(void) {
-  if (any_device_has_nvlink_active) {
-    sizeof_device_field[device_fan_speed] = 8; // "FAN %3u%%" (was 11 with padding)
-  } else {
-    sizeof_device_field[device_fan_speed] = 11; // Restore default padding
-  }
-}
+// The NVLink throughput no longer shares line 2, so the fan keeps its padding
+// in every layout.
 
 bool nvtop_probe_nvlink_list(struct list_head *devices) {
   // Skip re-probing if we already know at least one device has NVLink.
@@ -144,14 +136,84 @@ bool nvtop_probe_extra_temps_list(struct list_head *devices) {
   return any_device_has_extra_temps;
 }
 
-// Width the junction and memory fields take on line 2, zero where no monitored
-// device reports them. Shared by the allocation and the panel width computation so
-// the two cannot drift apart.
-static unsigned int extra_temps_line2_width(unsigned int spacer) {
-  if (!any_device_has_extra_temps)
-    return 0;
+// ---------------------------------------------------------------------------
+// Device header layout
+//
+// Line 1 is the device name and the PCIe throughput, line 2 packs the clocks,
+// the three temperatures, the fan and the power draw into one row of
+// fixed-width windows. How wide that row may be is decided by the console: on
+// one too narrow for the full row the fields give ground in a fixed order -
+// the power drain first, then the clock labels, then whole fields, the three
+// temperatures last - so the header always fits instead of running off the
+// right edge. The same description drives the window allocation and the panel
+// width, so the two cannot drift apart.
+struct device_header_layout {
+  bool show_clock, show_mem_clock, show_junction, show_vram, show_fan, show_power;
+  // The session min/max printed after the reading; each temperature loses it
+  // at its own rung of the ladder in nvtop_fit_device_header().
+  bool temp_minmax, junction_minmax, vram_minmax;
+  bool show_ecc, show_nvlink;
+  unsigned nvlink_width; // "NVL3 0x" idles at 8, throughput needs 19
+  bool clock_plain;      // clocks drawn without their "GPU " / memory label
+  bool pcie_full;        // the PCIe line takes one of three shapes, by its room
+  bool pcie_with_rates;
+};
 
-  return sizeof_device_field[device_junction_temp] + sizeof_device_field[device_vram_temp] + 2u * spacer;
+static struct device_header_layout header_layout;
+
+// The width a line-2 field needs in each of its two shapes: with the session
+// min/max printed after the reading, and without it.
+struct line2_shape {
+  unsigned with_minmax;
+  unsigned plain;
+};
+
+static const struct line2_shape clock_shape = {11, 7};    // "GPU 9999MHz" / "9999MHz"
+static const struct line2_shape mem_clock_shape = {12, 8}; // "GDDR6 9501MHz" / "9501MHz"
+static const struct line2_shape temp_shape = {17, 10};     // "TEMP 210° 95/110" / "TEMP 110°C"
+static const struct line2_shape junction_shape = {16, 10}; // "JCT 110° 95/110" / "JCT 110°C"
+static const struct line2_shape vram_shape = {16, 11};     // "VRAM 110° 95/110" / "VRAM 110°C"
+static const struct line2_shape fan_shape = {11, 8};       // "FAN 9999RPM" / "FAN 45%"
+static const struct line2_shape power_shape = {15, 15};   // "POW 218 / 250W", the original nvtop shape either way
+
+// The width line 2 of the header occupies: every shown field plus one spacer
+// between neighbours, with the ECC and NVLink windows appended after power.
+static unsigned line2_width(void) {
+  unsigned width = 0;
+  unsigned shown = 0;
+
+  if (header_layout.show_clock) {
+    width += sizeof_device_field[device_clock];
+    shown++;
+  }
+  if (header_layout.show_mem_clock) {
+    width += sizeof_device_field[device_mem_clock];
+    shown++;
+  }
+  // The core temperature is never given up entirely
+  width += sizeof_device_field[device_temperature];
+  shown++;
+  if (header_layout.show_junction && any_device_has_extra_temps) {
+    width += sizeof_device_field[device_junction_temp];
+    shown++;
+  }
+  if (header_layout.show_vram && any_device_has_extra_temps) {
+    width += sizeof_device_field[device_vram_temp];
+    shown++;
+  }
+  if (header_layout.show_fan) {
+    width += sizeof_device_field[device_fan_speed];
+    shown++;
+  }
+  if (header_layout.show_power) {
+    width += sizeof_device_field[device_power];
+    shown++;
+  }
+  if (shown > 1)
+    width += shown - 1;
+  if (header_layout.show_ecc && any_device_has_ecc)
+    width += 1 + sizeof_device_field[device_ecc];
+  return width;
 }
 
 static unsigned int sizeof_process_field[process_field_count] = {
@@ -161,21 +223,143 @@ static unsigned int sizeof_process_field[process_field_count] = {
     [process_cpu_usage] = 6, [process_cpu_mem_usage] = 9, [process_command] = 0,
 };
 
-// NVLink window geometry on device line 2. The window is appended after power
-// (and ECC, when present); its width is derived from the PCIe field width.
-// Shared by alloc_device_window() and device_length() so the allocated window
-// and the reserved panel width can never drift apart.
-static unsigned int nvlink_line2_start(unsigned int spacer) {
-  unsigned int start = spacer * 6 + sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock] +
-                       sizeof_device_field[device_temperature] + extra_temps_line2_width(spacer) +
-                       sizeof_device_field[device_fan_speed] + sizeof_device_field[device_power];
-  if (any_device_has_ecc)
-    start += sizeof_device_field[device_ecc];
-  return start;
-}
+// Fits the header to the console: starts from the full row and walks down a
+// fixed ladder of give-ups until it fits. The rungs are ordered by how little
+// each one costs: the power drain, the clock labels, the NVLink and ECC
+// windows, the min/max of the two memory temperatures, and only then whole
+// fields - the core temperature keeps its min/max until everything else on the
+// row is gone.
+static void nvtop_fit_device_header(unsigned cols) {
+  header_layout.show_clock = true;
+  header_layout.show_mem_clock = true;
+  header_layout.show_junction = true;
+  header_layout.show_vram = true;
+  header_layout.show_fan = true;
+  header_layout.show_power = true;
+  header_layout.temp_minmax = true;
+  header_layout.junction_minmax = true;
+  header_layout.vram_minmax = true;
+  header_layout.show_ecc = any_device_has_ecc;
+  header_layout.show_nvlink = any_device_has_nvlink;
+  header_layout.nvlink_width = any_device_has_nvlink_active ? 19 : 8;
+  header_layout.clock_plain = false;
+  header_layout.pcie_full = false;
+  header_layout.pcie_with_rates = false;
 
-static unsigned int nvlink_line2_width(unsigned int spacer) {
-  return sizeof_device_field[device_pcie] - sizeof_device_field[device_power] - spacer * 3;
+  sizeof_device_field[device_temperature] = temp_shape.with_minmax;
+  sizeof_device_field[device_junction_temp] = junction_shape.with_minmax;
+  sizeof_device_field[device_vram_temp] = vram_shape.with_minmax;
+  sizeof_device_field[device_clock] = clock_shape.with_minmax;
+  sizeof_device_field[device_mem_clock] = mem_clock_shape.with_minmax;
+  sizeof_device_field[device_fan_speed] = fan_shape.with_minmax;
+  sizeof_device_field[device_power] = power_shape.with_minmax;
+
+  // Line 1 gives the PCIe throughput whatever room the name leaves over, at
+  // most as much as its longest shape needs. Below 40 columns the rates drop
+  // off, below 9 only "PCIe" stays of the link generation. The NVLink
+  // throughput sits right after the PCIe field, so it is reserved a slice of
+  // the same room — and given up entirely when the PCIe shape would fall
+  // below its smallest one.
+  int room = (int)cols - (int)sizeof_device_field[device_name] - 1;
+  if (any_device_has_nvlink) {
+    int nvlink_room = room - (int)header_layout.nvlink_width - 1;
+    if (nvlink_room < 14) // not even "PCIe GEN 4@16x" fits beside it
+      header_layout.show_nvlink = false;
+    else
+      room = nvlink_room;
+  }
+  // Each PCIe shape is sized to what it actually draws, so the NVLink field
+  // sits snugly after it instead of after a run of blanks: the verbose form
+  // measures 46, the abbreviated rates 30, the bare link generation 14.
+  unsigned pcie_width;
+  if (room >= 46) {
+    pcie_width = 46;
+    header_layout.pcie_full = true;
+  } else if (room >= 30) {
+    pcie_width = 30;
+    header_layout.pcie_with_rates = true;
+  } else {
+    pcie_width = room < 0 ? 0 : (unsigned)room;
+  }
+  sizeof_device_field[device_pcie] = pcie_width;
+
+  // The ladder: each rung names what the row gives up next, applied while the
+  // row is wider than the console.
+  enum header_give_up {
+    give_up_fan_padding,
+    give_up_mem_clock_label,
+    give_up_clock_label,
+    give_up_ecc,
+    give_up_vram_minmax,
+    give_up_junction_minmax,
+    give_up_fan,
+    give_up_mem_clock,
+    give_up_clock,
+    give_up_vram,
+    give_up_junction,
+    give_up_temp_minmax,
+    give_up_power,
+    give_up_count
+  };
+  static const enum header_give_up next_rung[give_up_count] = {
+      [give_up_fan_padding] = give_up_mem_clock_label, [give_up_mem_clock_label] = give_up_clock_label,
+      [give_up_clock_label] = give_up_ecc,             [give_up_ecc] = give_up_vram_minmax,
+      [give_up_vram_minmax] = give_up_junction_minmax, [give_up_junction_minmax] = give_up_fan,
+      [give_up_fan] = give_up_mem_clock,               [give_up_mem_clock] = give_up_clock,
+      [give_up_clock] = give_up_vram,                  [give_up_vram] = give_up_junction,
+      [give_up_junction] = give_up_temp_minmax,        [give_up_temp_minmax] = give_up_power,
+      [give_up_power] = give_up_count,
+  };
+  for (enum header_give_up rung = give_up_fan_padding; line2_width() > cols && rung < give_up_count;) {
+    switch (rung) {
+    case give_up_fan_padding:
+      sizeof_device_field[device_fan_speed] = fan_shape.plain;
+      break;
+    case give_up_mem_clock_label:
+      header_layout.clock_plain = true; // both clocks lose their label together
+      sizeof_device_field[device_mem_clock] = mem_clock_shape.plain;
+      break;
+    case give_up_clock_label:
+      sizeof_device_field[device_clock] = clock_shape.plain;
+      break;
+    case give_up_ecc:
+      header_layout.show_ecc = false;
+      break;
+    case give_up_vram_minmax:
+      header_layout.vram_minmax = false;
+      sizeof_device_field[device_vram_temp] = vram_shape.plain;
+      break;
+    case give_up_junction_minmax:
+      header_layout.junction_minmax = false;
+      sizeof_device_field[device_junction_temp] = junction_shape.plain;
+      break;
+    case give_up_power:
+      header_layout.show_power = false;
+      break;
+    case give_up_fan:
+      header_layout.show_fan = false;
+      break;
+    case give_up_mem_clock:
+      header_layout.show_mem_clock = false;
+      break;
+    case give_up_clock:
+      header_layout.show_clock = false;
+      break;
+    case give_up_vram:
+      header_layout.show_vram = false;
+      break;
+    case give_up_junction:
+      header_layout.show_junction = false;
+      break;
+    case give_up_temp_minmax:
+      header_layout.temp_minmax = false;
+      sizeof_device_field[device_temperature] = temp_shape.plain;
+      break;
+    case give_up_count:
+      break;
+    }
+    rung = next_rung[rung];
+  }
 }
 
 static void alloc_device_window(unsigned int start_row, unsigned int start_col, unsigned int totalcol,
@@ -183,85 +367,63 @@ static void alloc_device_window(unsigned int start_row, unsigned int start_col, 
                                 struct device_window *dwin) {
 
   const unsigned int spacer = 1;
-  const unsigned int extra_temps = extra_temps_line2_width(spacer);
 
   // Not every info slot gets a window, so the unused ones have to read as
   // absent rather than as leftovers of the previous layout
   memset(dwin->extra_info, 0, sizeof(dwin->extra_info));
-
-  // Line 1 = Name | PCIe info
-
-  dwin->name_win = newwin(1, sizeof_device_field[device_name], start_row, start_col);
-  if (dwin->name_win == NULL)
-    goto alloc_error;
-  dwin->pcie_info =
-      newwin(1, sizeof_device_field[device_pcie], start_row, start_col + spacer + sizeof_device_field[device_name]);
-  if (dwin->pcie_info == NULL)
-    goto alloc_error;
-
-  // Line 2 = GPU clk | MEM clk | Temp | Junction | VRAM | Fan | Power | NVLink
-  dwin->gpu_clock_info = newwin(1, sizeof_device_field[device_clock], start_row + 1, start_col);
-  if (dwin->gpu_clock_info == NULL)
-    goto alloc_error;
-  dwin->mem_clock_info = newwin(1, sizeof_device_field[device_mem_clock], start_row + 1,
-                                start_col + spacer + sizeof_device_field[device_clock]);
-  if (dwin->mem_clock_info == NULL)
-    goto alloc_error;
-  dwin->temperature =
-      newwin(1, sizeof_device_field[device_temperature], start_row + 1,
-             start_col + spacer * 2 + sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock]);
-  if (dwin->temperature == NULL)
-    goto alloc_error;
-  // The two temperatures the core one says nothing about, where they are reported
   dwin->junction_temp = NULL;
   dwin->vram_temp = NULL;
-  if (any_device_has_extra_temps) {
-    dwin->junction_temp = newwin(1, sizeof_device_field[device_junction_temp], start_row + 1,
-                                 start_col + spacer * 3 + sizeof_device_field[device_clock] +
-                                     sizeof_device_field[device_mem_clock] + sizeof_device_field[device_temperature]);
-    if (dwin->junction_temp == NULL)
-      goto alloc_error;
-    dwin->vram_temp =
-        newwin(1, sizeof_device_field[device_vram_temp], start_row + 1,
-               start_col + spacer * 4 + sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock] +
-                   sizeof_device_field[device_temperature] + sizeof_device_field[device_junction_temp]);
-    if (dwin->vram_temp == NULL)
-      goto alloc_error;
-  }
-  dwin->fan_speed = newwin(1, sizeof_device_field[device_fan_speed], start_row + 1,
-                           start_col + spacer * 3 + sizeof_device_field[device_clock] +
-                               sizeof_device_field[device_mem_clock] + sizeof_device_field[device_temperature] +
-                               extra_temps);
-  if (dwin->fan_speed == NULL)
-    goto alloc_error;
-  dwin->power_info =
-      newwin(1, sizeof_device_field[device_power], start_row + 1,
-             start_col + spacer * 4 + sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock] +
-                 sizeof_device_field[device_temperature] + extra_temps + sizeof_device_field[device_fan_speed]);
-  if (dwin->power_info == NULL)
-    goto alloc_error;
-  // ECC errors appended to power_info on the same row (start_row + 1), only when
-  // at least one monitored GPU exposes ECC counters.
-  if (any_device_has_ecc) {
-    dwin->ecc_info =
-        newwin(1, sizeof_device_field[device_ecc], start_row + 1,
-               start_col + spacer * 5 + sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock] +
-                   sizeof_device_field[device_temperature] + extra_temps + sizeof_device_field[device_fan_speed] +
-                   sizeof_device_field[device_power]);
-    if (dwin->ecc_info == NULL)
-      goto alloc_error;
-  } else {
-    dwin->ecc_info = NULL;
-  }
+  dwin->ecc_info = NULL;
+  dwin->nvlink_info = NULL;
 
-  // NVLink appended after power (and ECC when present) on the same row (start_row + 1)
-  if (any_device_has_nvlink) {
-    dwin->nvlink_info = newwin(1, nvlink_line2_width(spacer), start_row + 1, start_col + nvlink_line2_start(spacer));
+  // Line 1 = Name | PCIe info. The two windows are placed in sequence, the
+  // same way line 2 is, so the reserved panel width and the allocation can
+  // never drift apart.
+  unsigned int col = start_col;
+  dwin->name_win = newwin(1, sizeof_device_field[device_name], start_row, col);
+  if (dwin->name_win == NULL)
+    goto alloc_error;
+  col += sizeof_device_field[device_name] + spacer;
+  dwin->pcie_info = newwin(1, sizeof_device_field[device_pcie], start_row, col);
+  if (dwin->pcie_info == NULL)
+    goto alloc_error;
+  col += sizeof_device_field[device_pcie] + spacer;
+  // The NVLink throughput sits beside the PCIe one on line 1; boards without
+  // the bridge keep a blank slot there, exactly as they did on line 2.
+  if (header_layout.show_nvlink && any_device_has_nvlink) {
+    dwin->nvlink_info = newwin(1, header_layout.nvlink_width, start_row, col);
     if (dwin->nvlink_info == NULL)
       goto alloc_error;
-  } else {
-    dwin->nvlink_info = NULL;
+    col += header_layout.nvlink_width + spacer;
   }
+
+  // Line 2, in display order: GPU clk | MEM clk | Temp | Junction | VRAM |
+  // Fan | Power | ECC. A field the layout gave up gets no window at all, so
+  // nothing of it is drawn and the row ends where the console ends.
+#define ALLOC_LINE2_FIELD(win, shown, width)                                                   \
+  do {                                                                                         \
+    if (shown) {                                                                               \
+      win = newwin(1, width, start_row + 1, col);                                              \
+      if (win == NULL)                                                                         \
+        goto alloc_error;                                                                      \
+      col += width + spacer;                                                                   \
+    } else {                                                                                   \
+      win = NULL;                                                                              \
+    }                                                                                          \
+  } while (0)
+
+  col = start_col;
+  ALLOC_LINE2_FIELD(dwin->gpu_clock_info, header_layout.show_clock, sizeof_device_field[device_clock]);
+  ALLOC_LINE2_FIELD(dwin->mem_clock_info, header_layout.show_mem_clock, sizeof_device_field[device_mem_clock]);
+  ALLOC_LINE2_FIELD(dwin->temperature, true, sizeof_device_field[device_temperature]);
+  ALLOC_LINE2_FIELD(dwin->junction_temp, header_layout.show_junction && any_device_has_extra_temps,
+                    sizeof_device_field[device_junction_temp]);
+  ALLOC_LINE2_FIELD(dwin->vram_temp, header_layout.show_vram && any_device_has_extra_temps,
+                    sizeof_device_field[device_vram_temp]);
+  ALLOC_LINE2_FIELD(dwin->fan_speed, header_layout.show_fan, sizeof_device_field[device_fan_speed]);
+  ALLOC_LINE2_FIELD(dwin->power_info, header_layout.show_power, sizeof_device_field[device_power]);
+  ALLOC_LINE2_FIELD(dwin->ecc_info, header_layout.show_ecc && any_device_has_ecc, sizeof_device_field[device_ecc]);
+#undef ALLOC_LINE2_FIELD
 
   // Line 3 = GPU used | MEM used | Encoder | Decoder
 
@@ -336,7 +498,11 @@ static void alloc_device_window(unsigned int start_row, unsigned int start_col, 
   // bar. When present, the NVLink error counters take the first one and the
   // generic grid of clock domains and static specs fills the rows below. Only
   // the cells the reserved rows have room for get a window; the rest stay NULL.
-  const bool nvlink_errors_row = options->has_gpu_info_bar && any_device_has_nvlink_active;
+  // The NVLink error counters take a full row of their own; on a console too
+  // narrow for the 33 columns they need the row is left out entirely.
+  const bool nvlink_errors_row =
+      options->has_gpu_info_bar && any_device_has_nvlink_active &&
+      totalcol >= sizeof_device_field[device_nvlink_errors];
   const unsigned int info_bar_row = start_row + 3;
   if (nvlink_errors_row) {
     dwin->nvlink_errors = newwin(1, sizeof_device_field[device_nvlink_errors], info_bar_row, start_col);
@@ -349,11 +515,17 @@ static void alloc_device_window(unsigned int start_row, unsigned int start_col, 
   const unsigned int nvlink_row_count = nvlink_errors_row ? 1u : 0u;
   const unsigned int grid_rows = extra_info_rows > nvlink_row_count ? extra_info_rows - nvlink_row_count : 0u;
   const unsigned int grid_start = info_bar_row + nvlink_row_count;
+  // On a narrow console fewer than the full four cells fit side by side; the
+  // cells that would start past the panel edge get no window and stay empty.
+  const unsigned int cell_step = sizeof_device_field[device_extra_info] + spacer;
+  const unsigned int grid_cols_per_row = totalcol / cell_step;
   const unsigned int extra_info_shown = min(grid_rows * EXTRA_INFO_PER_ROW, (unsigned int)MAX_EXTRA_INFO_ITEMS);
   for (unsigned int i = 0; i < extra_info_shown; ++i) {
+    if (i % EXTRA_INFO_PER_ROW >= grid_cols_per_row)
+      continue; // no room for this cell on the row
     dwin->extra_info[i] =
         newwin(1, sizeof_device_field[device_extra_info], grid_start + i / EXTRA_INFO_PER_ROW,
-               start_col + (i % EXTRA_INFO_PER_ROW) * (sizeof_device_field[device_extra_info] + spacer));
+               start_col + (i % EXTRA_INFO_PER_ROW) * cell_step);
     if (dwin->extra_info[i] == NULL)
       goto alloc_error;
   }
@@ -546,25 +718,12 @@ static void alloc_plot_window(unsigned devices_count, struct window_position *pl
 }
 
 static unsigned device_length(void) {
-  const unsigned int spacer = 1;
-
+  // Line 1 carries the name, the PCIe shape and — since the NVLink throughput
+  // sits beside the PCIe one — the NVLink field.
   unsigned line1 = sizeof_device_field[device_name] + sizeof_device_field[device_pcie] + 1;
-
-  // Line 2 base: clock, mem_clock, temp, fan, power + spacers (4 spacers + 1 = 5)
-  // ECC and the junction/memory temperatures are only counted where a monitored
-  // GPU reports them, so consumer systems keep the original narrower panel width.
-  unsigned line2 = sizeof_device_field[device_clock] + sizeof_device_field[device_mem_clock] +
-                   sizeof_device_field[device_temperature] + extra_temps_line2_width(spacer) +
-                   sizeof_device_field[device_fan_speed] + sizeof_device_field[device_power] + 5;
-  if (any_device_has_ecc)
-    line2 += sizeof_device_field[device_ecc] + 1;
-
-  // The NVLink window is appended to line 2 and must be part of the panel width,
-  // otherwise it overlaps the next device header when several devices share a row.
-  if (any_device_has_nvlink)
-    line2 = max(line2, nvlink_line2_start(spacer) + nvlink_line2_width(spacer) + 1);
-
-  return max(line1, line2);
+  if (header_layout.show_nvlink && any_device_has_nvlink)
+    line1 += 1 + header_layout.nvlink_width;
+  return max(line1, line2_width());
 }
 
 static pid_t nvtop_pid;
@@ -581,9 +740,12 @@ static void initialize_all_windows(struct nvtop_interface *dwin) {
   struct window_position plot_positions[MAX_CHARTS];
   struct window_position setup_position;
 
-  // NVLink layout adjustments must happen before panel dimensions are computed.
-  // any_device_has_nvlink_active is set by the probe that runs before this function.
-  nvtop_adjust_field_sizes_for_nvlink();
+  // NVLink used to sit on line 2 and squeeze the fan; since it moved next to
+  // the PCIe field, the fan keeps its full width.
+
+  // The header is fitted to the console before the layout is computed from its
+  // width, so a narrow terminal gets a narrow header instead of a cut-off one.
+  nvtop_fit_device_header(cols);
 
   unsigned int device_rows = 3 + dwin->extra_info_rows;
   compute_sizes_from_layout(devices_count, device_rows, device_length(), rows - 1, cols,
@@ -647,7 +809,8 @@ static void initialize_colors(const unsigned char plot_color_idx[MAX_LINES_PER_P
   init_pair(blue_color, COLOR_BLUE, background_color);
   init_pair(magenta_color, COLOR_MAGENTA, background_color);
   static const short gpu_plot_pairs[MAX_LINES_PER_PLOT] = {
-      gpu_util_plot_color, gpu_mem_plot_color, gpu_plot_color_3, gpu_plot_color_4};
+      gpu_util_plot_color, gpu_mem_plot_color, gpu_plot_color_3, gpu_plot_color_4, gpu_plot_color_5,
+      gpu_plot_color_6,    gpu_plot_color_7,   gpu_plot_color_8,  gpu_plot_color_9,  gpu_plot_color_10};
   for (unsigned s = 0; s < MAX_LINES_PER_PLOT; ++s)
     init_pair(gpu_plot_pairs[s], plot_terminal_colors[plot_color_idx[s]], background_color);
 }
@@ -684,7 +847,7 @@ struct nvtop_interface *initialize_curses(unsigned total_devices, unsigned devic
     }
   }
 
-  interface_alloc_ring_buffer(devices_count, 4, 10 * 60 * 1000, &interface->saved_data_ring);
+  interface_alloc_ring_buffer(devices_count, MAX_LINES_PER_PLOT, 10 * 60 * 1000, &interface->saved_data_ring);
   initialize_all_windows(interface);
   return interface;
 }
@@ -765,7 +928,62 @@ static void format_bytes(char *buffer, size_t size, uint64_t bytes) {
     snprintf(buffer, size, "%.2f%s%s", value, memory_prefix[unit], suffix);
 }
 
-static void draw_temp_color(WINDOW *win, unsigned int temp, unsigned int temp_slowdown, bool celsius) {
+// Keep the session extremes of one temperature. The readings arrive in
+// celsius and are stored the same way; the conversion happens at the drawing.
+static void track_temp_extremes(bool *seen, unsigned *temp_min, unsigned *temp_max, unsigned val) {
+  if (!*seen) {
+    *seen = true;
+    *temp_min = val;
+    *temp_max = val;
+  } else {
+    if (val < *temp_min)
+      *temp_min = val;
+    if (val > *temp_max)
+      *temp_max = val;
+  }
+}
+
+// F7: forget the session min/max of the three temperatures. The header shows
+// them again from the next reading on.
+void nvtop_reset_temperature_history(struct nvtop_interface *interface) {
+  for (unsigned i = 0; i < interface->monitored_dev_count; ++i) {
+    struct device_window *dev = &interface->devices_win[i];
+    dev->temp_seen = false;
+    dev->jct_seen = false;
+    dev->vram_seen = false;
+    dev->temp_min = dev->temp_max = 0;
+    dev->jct_min = dev->jct_max = 0;
+    dev->vram_min = dev->vram_max = 0;
+  }
+}
+
+// F8: cycle the graph presets for every monitored device — everything the
+// board reports (the utilization pair beside the temperatures), the original
+// nvtop pair alone, or only the temperatures this fork adds. Stale ring data
+// is dropped so a line never carries over points of another preset.
+void nvtop_cycle_graph_display_mode(struct nvtop_interface *interface) {
+  interface->options.graph_display_mode = (interface->options.graph_display_mode + 1) % 3;
+  unsigned mode = interface->options.graph_display_mode;
+  for (unsigned i = 0; i < interface->monitored_dev_count; ++i) {
+    plot_info_to_draw to_draw = 0;
+    if (mode != 2) // temperatures only
+      to_draw = (1 << plot_gpu_rate) | (1 << plot_gpu_mem_rate);
+    if (mode != 1) { // the original nvtop pair alone
+      struct gpu_info *device = interface->options.gpu_specific_opts[i].linkedGpu;
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_temp))
+        to_draw |= 1 << plot_gpu_temperature;
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, junction_temp))
+        to_draw |= 1 << plot_junction_temperature;
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, vram_temp))
+        to_draw |= 1 << plot_vram_temperature;
+    }
+    interface->options.gpu_specific_opts[i].to_draw = to_draw;
+    interface_ring_buffer_empty(&interface->saved_data_ring, i);
+  }
+}
+
+static void draw_temp_color(WINDOW *win, unsigned int temp, unsigned int temp_slowdown, bool celsius,
+                            bool has_minmax, unsigned int temp_min, unsigned int temp_max) {
   unsigned int temp_convert;
   if (celsius)
     temp_convert = temp;
@@ -786,10 +1004,18 @@ static void draw_temp_color(WINDOW *win, unsigned int temp, unsigned int temp_sl
   wstandend(win);
 
   waddch(win, ACS_DEGREE);
-  if (celsius)
+  if (has_minmax) {
+    // The session min/max in place of the unit: "TEMP 57° 45/61". Both keep
+    // the conversion of the reading itself, and stay plain - the color is
+    // about how hot it is right now, not about how hot it has been.
+    unsigned int min_convert = celsius ? temp_min : (unsigned)(32 + nearbyint(temp_min * 1.8));
+    unsigned int max_convert = celsius ? temp_max : (unsigned)(32 + nearbyint(temp_max * 1.8));
+    wprintw(win, " %u/%u", min_convert, max_convert);
+  } else if (celsius) {
     waddch(win, 'C');
-  else
+  } else {
     waddch(win, 'F');
+  }
   wnoutrefresh(win);
 }
 
@@ -821,7 +1047,8 @@ static bool temp_ceiling_of_the_memory(const struct gpuinfo_static_info *static_
 // where the driver reports no ceiling at all, the value stands on its own rather than
 // against a limit nvtop would have invented.
 static void draw_extra_temp(WINDOW *win, const char *label, unsigned int temp, unsigned int ceiling,
-                            unsigned int warning_margin, bool has_ceiling, bool celsius) {
+                            unsigned int warning_margin, bool has_ceiling, bool celsius, bool has_minmax,
+                            unsigned int temp_min, unsigned int temp_max) {
   unsigned int temp_convert;
   if (celsius)
     temp_convert = temp;
@@ -843,10 +1070,16 @@ static void draw_extra_temp(WINDOW *win, const char *label, unsigned int temp, u
   wstandend(win);
 
   waddch(win, ACS_DEGREE);
-  if (celsius)
+  if (has_minmax) {
+    // The session min/max in place of the unit, plain as the core one keeps them
+    unsigned int min_convert = celsius ? temp_min : (unsigned)(32 + nearbyint(temp_min * 1.8));
+    unsigned int max_convert = celsius ? temp_max : (unsigned)(32 + nearbyint(temp_max * 1.8));
+    wprintw(win, " %u/%u", min_convert, max_convert);
+  } else if (celsius) {
     waddch(win, 'C');
-  else
+  } else {
     waddch(win, 'F');
+  }
   wnoutrefresh(win);
 }
 
@@ -874,6 +1107,23 @@ static void print_data_at_scale(WINDOW *win, unsigned long long value) {
     }
   }
   wprintw(win, " %sB/s", memory_prefix[prefix_off]);
+}
+
+// print_data_at_scale with the unit implied and one decimal: "9.2G" instead of
+// "9.250 GiB/s", for the abbreviated PCIe shape of a narrow console.
+static void print_rate_at_scale_compact(WINDOW *win, unsigned long long value) {
+  double val_d = value;
+  const char *prefix = "B";
+  for (int i = 0; i < 5 && val_d >= 1024.; ++i) {
+    val_d /= 1024.;
+    prefix = memory_prefix[i + 1];
+  }
+  if (val_d >= 100.)
+    wprintw(win, "%.0f%s", val_d, prefix);
+  else if (val_d >= 10.)
+    wprintw(win, "%.1f%s", val_d, prefix);
+  else
+    wprintw(win, "%.2f%s", val_d, prefix);
 }
 
 // print_data_at_scale (renamed from print_pcie_at_scale): reused for NVLink throughput
@@ -1087,6 +1337,15 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
   list_for_each_entry(device, devices, list) {
     struct device_window *dev = &interface->devices_win[dev_id];
 
+    // Keep the session extremes of the three temperatures; the header prints
+    // them after the current reading and F7 clears them.
+    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_temp))
+      track_temp_extremes(&dev->temp_seen, &dev->temp_min, &dev->temp_max, device->dynamic_info.gpu_temp);
+    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, junction_temp))
+      track_temp_extremes(&dev->jct_seen, &dev->jct_min, &dev->jct_max, device->dynamic_info.junction_temp);
+    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, vram_temp))
+      track_temp_extremes(&dev->vram_seen, &dev->vram_min, &dev->vram_max, device->dynamic_info.vram_temp);
+
     wcolor_set(dev->name_win, cyan_color, NULL);
     mvwprintw(dev->name_win, 0, 0, "Device %-2u", dev_id);
     wstandend(dev->name_win);
@@ -1188,7 +1447,8 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
         device->static_info.temperature_slowdown_threshold = 0;
       draw_temp_color(dev->temperature, device->dynamic_info.gpu_temp,
                       device->static_info.temperature_slowdown_threshold,
-                      !interface->options.temperature_in_fahrenheit);
+                      !interface->options.temperature_in_fahrenheit, dev->temp_seen && header_layout.temp_minmax,
+                      dev->temp_min, dev->temp_max);
     } else {
       mvwprintw(dev->temperature, 0, 0, "TEMP N/A");
       waddch(dev->temperature, ACS_DEGREE);
@@ -1211,7 +1471,8 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
       werase(dev->junction_temp);
       if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, junction_temp))
         draw_extra_temp(dev->junction_temp, "JCT", device->dynamic_info.junction_temp, extra_ceiling,
-                        extra_warning_margin, has_extra_ceiling, !interface->options.temperature_in_fahrenheit);
+                        extra_warning_margin, has_extra_ceiling, !interface->options.temperature_in_fahrenheit,
+                        dev->jct_seen && header_layout.junction_minmax, dev->jct_min, dev->jct_max);
       else
         draw_extra_temp_unavailable(dev->junction_temp, "JCT");
     }
@@ -1219,91 +1480,116 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
       werase(dev->vram_temp);
       if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, vram_temp))
         draw_extra_temp(dev->vram_temp, "VRAM", device->dynamic_info.vram_temp, extra_ceiling,
-                        extra_warning_margin, has_extra_ceiling, !interface->options.temperature_in_fahrenheit);
+                        extra_warning_margin, has_extra_ceiling, !interface->options.temperature_in_fahrenheit,
+                        dev->vram_seen && header_layout.vram_minmax, dev->vram_min, dev->vram_max);
       else
         draw_extra_temp_unavailable(dev->vram_temp, "VRAM");
     }
 
-    // FAN
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, fan_speed)) {
-      if (any_device_has_nvlink_active) {
-        mvwprintw(dev->fan_speed, 0, 0, "FAN %3u%%",
-                  device->dynamic_info.fan_speed > 100 ? 100 : device->dynamic_info.fan_speed);
-        mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
+    // FAN. Dropped entirely when the row had nothing left to give it.
+    if (dev->fan_speed != NULL) {
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, fan_speed)) {
+        if (any_device_has_nvlink_active) {
+          mvwprintw(dev->fan_speed, 0, 0, "FAN %3u%%",
+                    device->dynamic_info.fan_speed > 100 ? 100 : device->dynamic_info.fan_speed);
+          mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
+        } else {
+          mvwprintw(dev->fan_speed, 0, 0, " FAN %3u%%  ",
+                    device->dynamic_info.fan_speed > 100 ? 100 : device->dynamic_info.fan_speed);
+          mvwchgat(dev->fan_speed, 0, 1, 3, 0, cyan_color, NULL);
+        }
+      } else if (device->static_info.integrated_graphics) {
+        if (any_device_has_nvlink_active) {
+          mvwprintw(dev->fan_speed, 0, 0, "CPU-FAN");
+          mvwchgat(dev->fan_speed, 0, 0, 7, 0, cyan_color, NULL);
+        } else {
+          mvwprintw(dev->fan_speed, 0, 0, "  CPU-FAN  ");
+          mvwchgat(dev->fan_speed, 0, 2, 7, 0, cyan_color, NULL);
+        }
+      } else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, fan_rpm)) {
+        if (any_device_has_nvlink_active) {
+          mvwprintw(dev->fan_speed, 0, 0, "FAN%3uR",
+                    device->dynamic_info.fan_rpm > 999 ? 999 : device->dynamic_info.fan_rpm);
+          mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
+        } else {
+          mvwprintw(dev->fan_speed, 0, 0, "FAN %4uRPM",
+                    device->dynamic_info.fan_rpm > 9999 ? 9999 : device->dynamic_info.fan_rpm);
+          mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
+        }
       } else {
-        mvwprintw(dev->fan_speed, 0, 0, " FAN %3u%%  ",
-                  device->dynamic_info.fan_speed > 100 ? 100 : device->dynamic_info.fan_speed);
-        mvwchgat(dev->fan_speed, 0, 1, 3, 0, cyan_color, NULL);
+        if (any_device_has_nvlink_active) {
+          mvwprintw(dev->fan_speed, 0, 0, "FAN N/A");
+          mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
+        } else {
+          mvwprintw(dev->fan_speed, 0, 0, "  FAN N/A  ");
+          mvwchgat(dev->fan_speed, 0, 2, 3, 0, cyan_color, NULL);
+        }
       }
-    } else if (device->static_info.integrated_graphics) {
-      if (any_device_has_nvlink_active) {
-        mvwprintw(dev->fan_speed, 0, 0, "CPU-FAN");
-        mvwchgat(dev->fan_speed, 0, 0, 7, 0, cyan_color, NULL);
-      } else {
-        mvwprintw(dev->fan_speed, 0, 0, "  CPU-FAN  ");
-        mvwchgat(dev->fan_speed, 0, 2, 7, 0, cyan_color, NULL);
-      }
-    } else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, fan_rpm)) {
-      if (any_device_has_nvlink_active) {
-        mvwprintw(dev->fan_speed, 0, 0, "FAN%3uR",
-                  device->dynamic_info.fan_rpm > 999 ? 999 : device->dynamic_info.fan_rpm);
-        mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
-      } else {
-        mvwprintw(dev->fan_speed, 0, 0, "FAN %4uRPM",
-                  device->dynamic_info.fan_rpm > 9999 ? 9999 : device->dynamic_info.fan_rpm);
-        mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
-      }
-    } else {
-      if (any_device_has_nvlink_active) {
-        mvwprintw(dev->fan_speed, 0, 0, "FAN N/A");
-        mvwchgat(dev->fan_speed, 0, 0, 3, 0, cyan_color, NULL);
-      } else {
-        mvwprintw(dev->fan_speed, 0, 0, "  FAN N/A  ");
-        mvwchgat(dev->fan_speed, 0, 2, 3, 0, cyan_color, NULL);
-      }
+      wnoutrefresh(dev->fan_speed);
     }
-    wnoutrefresh(dev->fan_speed);
 
-    // GPU CLOCK
-    werase(dev->gpu_clock_info);
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_clock_speed))
-      mvwprintw(dev->gpu_clock_info, 0, 0, "%.3s %uMHz", DEVICE_UNIT_NAME(device),
-                device->dynamic_info.gpu_clock_speed);
-    else
-      mvwprintw(dev->gpu_clock_info, 0, 0, "%.3s N/A MHz", DEVICE_UNIT_NAME(device));
-
-    mvwchgat(dev->gpu_clock_info, 0, 0, 3, 0, cyan_color, NULL);
-    wnoutrefresh(dev->gpu_clock_info);
+    // GPU CLOCK. When the layout dropped the labels the bare rate stands
+    // alone; the first three characters keep the label color either way.
+    if (dev->gpu_clock_info != NULL) {
+      werase(dev->gpu_clock_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_clock_speed)) {
+        if (header_layout.clock_plain)
+          mvwprintw(dev->gpu_clock_info, 0, 0, "%uMHz", device->dynamic_info.gpu_clock_speed);
+        else
+          mvwprintw(dev->gpu_clock_info, 0, 0, "%.3s %uMHz", DEVICE_UNIT_NAME(device),
+                    device->dynamic_info.gpu_clock_speed);
+      } else if (header_layout.clock_plain) {
+        mvwprintw(dev->gpu_clock_info, 0, 0, "N/A MHz");
+      } else {
+        mvwprintw(dev->gpu_clock_info, 0, 0, "%.3s N/A MHz", DEVICE_UNIT_NAME(device));
+      }
+      mvwchgat(dev->gpu_clock_info, 0, 0, 3, 0, cyan_color, NULL);
+      wnoutrefresh(dev->gpu_clock_info);
+    }
 
     // MEM CLOCK
-    werase(dev->mem_clock_info);
-    const char *mem_label = GPUINFO_STATIC_FIELD_VALID(&device->static_info, memory_type)
-      ? device->static_info.memory_type : "MEM";
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, mem_clock_speed))
-      mvwprintw(dev->mem_clock_info, 0, 0, "%s %uMHz", mem_label, device->dynamic_info.mem_clock_speed);
-    else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, mem_clock_speed_max))
-      mvwprintw(dev->mem_clock_info, 0, 0, "%s %uMHz", mem_label, device->dynamic_info.mem_clock_speed_max);
-    else
-      mvwprintw(dev->mem_clock_info, 0, 0, "%s N/A MHz", mem_label);
-    mvwchgat(dev->mem_clock_info, 0, 0, 3, 0, cyan_color, NULL);
-    wnoutrefresh(dev->mem_clock_info);
+    if (dev->mem_clock_info != NULL) {
+      werase(dev->mem_clock_info);
+      const char *mem_label = GPUINFO_STATIC_FIELD_VALID(&device->static_info, memory_type)
+        ? device->static_info.memory_type : "MEM";
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, mem_clock_speed)) {
+        if (header_layout.clock_plain)
+          mvwprintw(dev->mem_clock_info, 0, 0, "%uMHz", device->dynamic_info.mem_clock_speed);
+        else
+          mvwprintw(dev->mem_clock_info, 0, 0, "%s %uMHz", mem_label, device->dynamic_info.mem_clock_speed);
+      } else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, mem_clock_speed_max)) {
+        if (header_layout.clock_plain)
+          mvwprintw(dev->mem_clock_info, 0, 0, "%uMHz", device->dynamic_info.mem_clock_speed_max);
+        else
+          mvwprintw(dev->mem_clock_info, 0, 0, "%s %uMHz", mem_label, device->dynamic_info.mem_clock_speed_max);
+      } else if (header_layout.clock_plain) {
+        mvwprintw(dev->mem_clock_info, 0, 0, "N/A MHz");
+      } else {
+        mvwprintw(dev->mem_clock_info, 0, 0, "%s N/A MHz", mem_label);
+      }
+      mvwchgat(dev->mem_clock_info, 0, 0, 3, 0, cyan_color, NULL);
+      wnoutrefresh(dev->mem_clock_info);
+    }
 
-    // POWER
-    werase(dev->power_info);
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
-        GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
-      mvwprintw(dev->power_info, 0, 0, "POW %3u / %3u W", device->dynamic_info.power_draw / 1000,
-                device->dynamic_info.power_draw_max / 1000);
-    else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
-             !GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
-      mvwprintw(dev->power_info, 0, 0, "POW %3u W", device->dynamic_info.power_draw / 1000);
-    else if (!GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
-             GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
-      mvwprintw(dev->power_info, 0, 0, "POW N/A / %3u W", device->dynamic_info.power_draw_max / 1000);
-    else
-      mvwprintw(dev->power_info, 0, 0, "POW N/A W");
-    mvwchgat(dev->power_info, 0, 0, 3, 0, cyan_color, NULL);
-    wnoutrefresh(dev->power_info);
+    // POWER. Always the original nvtop shape, drain included; the label color
+    // still marks the field.
+    if (dev->power_info != NULL) {
+      werase(dev->power_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
+          GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
+        mvwprintw(dev->power_info, 0, 0, "POW %3u / %3u W", device->dynamic_info.power_draw / 1000,
+                  device->dynamic_info.power_draw_max / 1000);
+      else if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
+               !GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
+        mvwprintw(dev->power_info, 0, 0, "POW %3u W", device->dynamic_info.power_draw / 1000);
+      else if (!GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw) &&
+               GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, power_draw_max))
+        mvwprintw(dev->power_info, 0, 0, "POW N/A / %3u W", device->dynamic_info.power_draw_max / 1000);
+      else
+        mvwprintw(dev->power_info, 0, 0, "POW N/A W");
+      mvwchgat(dev->power_info, 0, 0, 3, 0, cyan_color, NULL);
+      wnoutrefresh(dev->power_info);
+    }
 
     // ECC errors (professional/datacenter cards only; window absent otherwise)
     if (dev->ecc_info != NULL) {
@@ -1326,7 +1612,7 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
       wnoutrefresh(dev->ecc_info);
     }
 
-    // NVLink info (on same row as power_info, after ECC)
+    // NVLink info (beside the PCIe throughput on line 1)
     if (dev->nvlink_info != NULL) {
       werase(dev->nvlink_info);
       struct nvlink_info nvl_info = {0};
@@ -1360,14 +1646,17 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
       wnoutrefresh(dev->nvlink_info);
     }
 
-    // PICe throughput
+    // PCIe throughput, in one of three shapes by the room line 1 has: the full
+    // "PCIe GEN 4@16x RX: ... TX: ...", a shorter one with the rates
+    // abbreviated ("GEN 4@16x 9.2G/10.1G"), and just the link generation.
     werase(dev->pcie_info);
     if (device->static_info.integrated_graphics) {
       wcolor_set(dev->pcie_info, cyan_color, NULL);
       mvwprintw(dev->pcie_info, 0, 0, "Integrated %s", DEVICE_UNIT_NAME(device));
     } else {
       wcolor_set(dev->pcie_info, cyan_color, NULL);
-      mvwprintw(dev->pcie_info, 0, 0, "PCIe ");
+      if (!header_layout.pcie_with_rates)
+        mvwprintw(dev->pcie_info, 0, 0, "PCIe ");
       wcolor_set(dev->pcie_info, magenta_color, NULL);
       wprintw(dev->pcie_info, "GEN ");
       wstandend(dev->pcie_info);
@@ -1378,20 +1667,40 @@ static void draw_devices(struct list_head *devices, struct nvtop_interface *inte
         wprintw(dev->pcie_info, "N/A");
     }
 
-    wcolor_set(dev->pcie_info, magenta_color, NULL);
-    wprintw(dev->pcie_info, " RX: ");
-    wstandend(dev->pcie_info);
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_rx))
-      print_data_at_scale(dev->pcie_info, device->dynamic_info.pcie_rx);
-    else
-      wprintw(dev->pcie_info, "N/A");
-    wcolor_set(dev->pcie_info, magenta_color, NULL);
-    wprintw(dev->pcie_info, " TX: ");
-    wstandend(dev->pcie_info);
-    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_tx))
-      print_data_at_scale(dev->pcie_info, device->dynamic_info.pcie_tx);
-    else
-      wprintw(dev->pcie_info, "N/A");
+    if (header_layout.pcie_with_rates) {
+      // The rates abbreviated: "9.2G" instead of "9.250 GiB/s", the unit
+      // implied. The magenta stays on the "RX"/"TX" markers only.
+      wcolor_set(dev->pcie_info, magenta_color, NULL);
+      wprintw(dev->pcie_info, " RX ");
+      wstandend(dev->pcie_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_rx))
+        print_rate_at_scale_compact(dev->pcie_info, device->dynamic_info.pcie_rx);
+      else
+        wprintw(dev->pcie_info, "N/A");
+      wprintw(dev->pcie_info, "/");
+      wcolor_set(dev->pcie_info, magenta_color, NULL);
+      wprintw(dev->pcie_info, "TX ");
+      wstandend(dev->pcie_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_tx))
+        print_rate_at_scale_compact(dev->pcie_info, device->dynamic_info.pcie_tx);
+      else
+        wprintw(dev->pcie_info, "N/A");
+    } else if (header_layout.pcie_full) {
+      wcolor_set(dev->pcie_info, magenta_color, NULL);
+      wprintw(dev->pcie_info, " RX: ");
+      wstandend(dev->pcie_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_rx))
+        print_data_at_scale(dev->pcie_info, device->dynamic_info.pcie_rx);
+      else
+        wprintw(dev->pcie_info, "N/A");
+      wcolor_set(dev->pcie_info, magenta_color, NULL);
+      wprintw(dev->pcie_info, " TX: ");
+      wstandend(dev->pcie_info);
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, pcie_tx))
+        print_data_at_scale(dev->pcie_info, device->dynamic_info.pcie_tx);
+      else
+        wprintw(dev->pcie_info, "N/A");
+    }
 
     wnoutrefresh(dev->pcie_info);
 
@@ -2153,10 +2462,10 @@ static void update_process_option_win(struct nvtop_interface *interface) {
 }
 
 static const char *option_selection_hidden[] = {
-    "Setup", "Sort", "Kill", "Quit", "Save Config",
+    "Setup", "Sort", "RstTemp", "Graph", "Kill", "Quit", "Save Config",
 };
 static const char *option_selection_hidden_num[] = {
-    "2", "6", "9", "10", "12",
+    "2", "6", "7", "8", "9", "10", "12",
 };
 
 static const char *option_selection_sort[][2] = {
@@ -2186,7 +2495,7 @@ static void draw_process_shortcuts(struct nvtop_interface *interface) {
           (strcmp(option_selection_hidden_num[i], "6") == 0 || strcmp(option_selection_hidden_num[i], "9") == 0))
         continue;
 
-      if (process_field_displayed_count(interface->options.process_fields_displayed) > 0 || (i != 1 && i != 2)) {
+      if (process_field_displayed_count(interface->options.process_fields_displayed) > 0 || i != 1) {
         wprintw(win, "F%s", option_selection_hidden_num[i]);
         wattr_set(win, A_STANDOUT, cyan_color, NULL);
         wprintw(win, "%-*s", option_selection_width, option_selection_hidden[i]);
@@ -2719,7 +3028,7 @@ bool show_information_messages(unsigned num_messages, const char **messages) {
     initscr();
     clear();
     refresh();
-    static const unsigned char default_plot_colors[MAX_LINES_PER_PLOT] = {1, 3, 2, 4};
+    static const unsigned char default_plot_colors[MAX_LINES_PER_PLOT] = {1, 3, 2, 4, 5, 6, 0, 1, 3, 2};
     initialize_colors(default_plot_colors);
     cbreak();
     noecho();

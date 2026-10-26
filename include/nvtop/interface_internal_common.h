@@ -57,6 +57,12 @@ enum interface_color {
   gpu_mem_plot_color,
   gpu_plot_color_3,
   gpu_plot_color_4,
+  gpu_plot_color_5,
+  gpu_plot_color_6,
+  gpu_plot_color_7,
+  gpu_plot_color_8,
+  gpu_plot_color_9,
+  gpu_plot_color_10,
 };
 
 struct device_window {
@@ -90,6 +96,17 @@ struct device_window {
   bool dec_was_visible;
   nvtop_time last_decode_seen;
   nvtop_time last_encode_seen;
+  // Session extremes of the core, junction and memory temperatures, kept in
+  // celsius. *_seen turns true at the first valid reading; F7 clears them.
+  bool temp_seen;
+  unsigned temp_min;
+  unsigned temp_max;
+  bool jct_seen;
+  unsigned jct_min;
+  unsigned jct_max;
+  bool vram_seen;
+  unsigned vram_min;
+  unsigned vram_max;
 };
 
 static const unsigned int option_window_size = 13;

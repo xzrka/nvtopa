@@ -136,6 +136,13 @@ void alloc_interface_options_internals(char *config_location, unsigned num_devic
   options->gpu_plot_color_idx[1] = 3;  // Yellow
   options->gpu_plot_color_idx[2] = 2;  // Green
   options->gpu_plot_color_idx[3] = 4;  // Blue
+  options->gpu_plot_color_idx[4] = 5;  // Magenta
+  options->gpu_plot_color_idx[5] = 6;  // White
+  options->gpu_plot_color_idx[6] = 0;  // Red
+  options->gpu_plot_color_idx[7] = 1;  // Cyan
+  options->gpu_plot_color_idx[8] = 3;  // Yellow
+  options->gpu_plot_color_idx[9] = 2;  // Green
+  options->graph_display_mode = 0;
   if (config_location) {
     options->config_file_location = malloc(strlen(config_location) + 1);
     if (!options->config_file_location) {
@@ -183,7 +190,8 @@ static const char header_value_all_info_bar[] = "AllInfoBar";
 static const char chart_section[] = "ChartOption";
 static const char chart_value_reverse[] = "ReverseChart";
 static const char *chart_value_gpu_plot_color[MAX_LINES_PER_PLOT] = {
-    "GpuPlotColor0", "GpuPlotColor1", "GpuPlotColor2", "GpuPlotColor3"};
+    "GpuPlotColor0", "GpuPlotColor1", "GpuPlotColor2", "GpuPlotColor3", "GpuPlotColor4",
+    "GpuPlotColor5", "GpuPlotColor6", "GpuPlotColor7", "GpuPlotColor8", "GpuPlotColor9"};
 
 static const char *plot_color_names[] = {
     "Red", "Cyan", "Green", "Yellow", "Blue", "Magenta", "White"};

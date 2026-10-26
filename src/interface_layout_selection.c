@@ -19,7 +19,10 @@ static unsigned min_rows_taken_by_process(unsigned rows, unsigned num_devices) {
 static const unsigned cols_needed_box_drawing = 5;
 static const unsigned min_plot_rows = 7;
 static unsigned min_plot_cols(unsigned num_data_info_to_plot) {
-  return cols_needed_box_drawing + 10 * num_data_info_to_plot;
+  // A floor per plotted line keeps charts from collapsing to slivers, but it
+  // must stay small enough that three devices with their five default lines
+  // still fit side by side on an 80-column terminal.
+  return cols_needed_box_drawing + 3 * num_data_info_to_plot;
 }
 
 // If true, returns two plot indices that yields to the lowest number of info in

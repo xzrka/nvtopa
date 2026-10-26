@@ -55,6 +55,7 @@ typedef struct nvtop_interface_option_struct {
   bool hide_processes_list;                         // Hide processes list
   bool dynamic_memory_units;                        // Scale process memory units automatically
   unsigned char gpu_plot_color_idx[MAX_LINES_PER_PLOT]; // index into plot_color_names[] per plot slot
+  unsigned char graph_display_mode;                 // F8 preset: 0 all, 1 original rates, 2 temperatures only
 } nvtop_interface_option;
 
 inline bool plot_isset_draw_info(enum plot_information check_info, plot_info_to_draw to_draw) {

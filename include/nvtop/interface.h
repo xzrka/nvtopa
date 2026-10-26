@@ -59,4 +59,8 @@ void print_snapshot(struct list_head *devices, bool use_fahrenheit_option, bool 
 
 void apply_plot_colors(const unsigned char plot_color_idx[MAX_LINES_PER_PLOT]);
 
+// F7: forget the session min/max of the temperatures the header keeps
+void nvtop_reset_temperature_history(struct nvtop_interface *interface);
+void nvtop_cycle_graph_display_mode(struct nvtop_interface *interface);
+
 #endif // INTERFACE_H_

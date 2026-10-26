@@ -45,7 +45,7 @@ static void *nvtop_reallocarray__(void *ptr, size_t nmemb, size_t size) {
 // 16 has been experimentally selected for being small while avoiding multiple allocations in most common cases
 #define COMMON_PROCESS_LINEAR_REALLOC_INC 16
 
-#define MAX_LINES_PER_PLOT 4
+#define MAX_LINES_PER_PLOT 10
 
 // Helper macro to stringify an integer
 #define QUOTE(x) #x

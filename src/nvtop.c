@@ -299,19 +299,6 @@ int main(int argc, char **argv) {
   nvtop_interface_option allDevicesOptions;
   alloc_interface_options_internals(custom_config_file_path, allDevCount, &monitoredGpus, &allDevicesOptions);
   load_interface_options_from_config_file(allDevCount, &allDevicesOptions);
-  struct gpu_info *dev;
-  unsigned dev_idx = 0;
-  list_for_each_entry(dev, &monitoredGpus, list) {
-    // Nothing specified in the file
-    if (!plot_isset_draw_info(plot_information_count, allDevicesOptions.gpu_specific_opts[dev_idx].to_draw)) {
-      allDevicesOptions.gpu_specific_opts[dev_idx].to_draw =
-          vendor_uses_npu_plots(dev->vendor) ? plot_npu_default_draw_info() : plot_default_draw_info();
-    } else {
-      allDevicesOptions.gpu_specific_opts[dev_idx].to_draw =
-          plot_remove_draw_info(plot_information_count, allDevicesOptions.gpu_specific_opts[dev_idx].to_draw);
-    }
-    dev_idx++;
-  }
   if (!process_is_field_displayed(process_field_count, allDevicesOptions.process_fields_displayed)) {
     allDevicesOptions.process_fields_displayed = process_default_displayed_field();
   } else {
@@ -320,11 +307,6 @@ int main(int argc, char **argv) {
   }
   if (no_color_option)
     allDevicesOptions.use_color = false;
-  if (hide_plot_option) {
-    for (unsigned i = 0; i < allDevCount; ++i) {
-      allDevicesOptions.gpu_specific_opts[i].to_draw = 0;
-    }
-  }
   if (hide_processes_option)
     allDevicesOptions.hide_processes_list = true;
   if (encode_decode_timer_option_set) {
@@ -350,6 +332,42 @@ int main(int argc, char **argv) {
   nvtop_probe_nvlink_list(&monitoredGpus);
   nvtop_probe_ecc_list(&monitoredGpus);
   nvtop_probe_extra_temps_list(&monitoredGpus);
+
+  // One refresh so the validity bits exist; the plot defaults below then pick
+  // exactly the temperatures this board reports.
+  gpuinfo_refresh_dynamic_info(&monitoredGpus);
+
+  struct gpu_info *dev;
+  unsigned dev_idx = 0;
+  list_for_each_entry(dev, &monitoredGpus, list) {
+    // Nothing specified in the file
+    if (!plot_isset_draw_info(plot_information_count, allDevicesOptions.gpu_specific_opts[dev_idx].to_draw)) {
+      plot_info_to_draw to_draw =
+          vendor_uses_npu_plots(dev->vendor) ? plot_npu_default_draw_info() : plot_default_draw_info();
+      if (!vendor_uses_npu_plots(dev->vendor)) {
+        // Every metric this board reports joins one chart: the utilization
+        // pair plus the temperatures, so narrow terminals still keep one
+        // chart per row of devices. The F8 hotkey switches presets and the
+        // Chart page turns any of them off again.
+        if (GPUINFO_DYNAMIC_FIELD_VALID(&dev->dynamic_info, gpu_temp))
+          to_draw = plot_add_draw_info(plot_gpu_temperature, to_draw);
+        if (GPUINFO_DYNAMIC_FIELD_VALID(&dev->dynamic_info, junction_temp))
+          to_draw = plot_add_draw_info(plot_junction_temperature, to_draw);
+        if (GPUINFO_DYNAMIC_FIELD_VALID(&dev->dynamic_info, vram_temp))
+          to_draw = plot_add_draw_info(plot_vram_temperature, to_draw);
+      }
+      allDevicesOptions.gpu_specific_opts[dev_idx].to_draw = to_draw;
+    } else {
+      allDevicesOptions.gpu_specific_opts[dev_idx].to_draw =
+          plot_remove_draw_info(plot_information_count, allDevicesOptions.gpu_specific_opts[dev_idx].to_draw);
+    }
+    dev_idx++;
+  }
+  if (hide_plot_option) {
+    for (unsigned i = 0; i < allDevCount; ++i) {
+      allDevicesOptions.gpu_specific_opts[i].to_draw = 0;
+    }
+  }
 
   if (allDevicesOptions.show_startup_messages) {
     bool dont_show_again = show_information_messages(numWarningMessages, warningMessages);
@@ -417,6 +435,13 @@ int main(int argc, char **argv) {
     case KEY_F(10):
       if (is_escape_for_quit(interface))
         signal_exit = 1;
+      break;
+    case KEY_F(7):
+      nvtop_reset_temperature_history(interface);
+      break;
+    case KEY_F(8):
+      if (is_escape_for_quit(interface))
+        nvtop_cycle_graph_display_mode(interface);
       break;
     case 'q':
       signal_exit = 1;

@@ -42,7 +42,9 @@ void nvtop_line_plot(WINDOW *win, size_t num_data, const double *data, unsigned 
   double increment = 100. / (double)(rows);
 
   assert(num_lines <= MAX_LINES_PER_PLOT && "Cannot plot more than " EXPAND_AND_QUOTE(MAX_LINES_PER_PLOT) " lines");
-  static const short plot_line_colors[MAX_LINES_PER_PLOT] = {7, 8, 9, 10};
+  // The color pairs nvtop asks the plot lines by; the values match the
+  // gpu_*_plot_color pairs initialize_colors() prepares (interface.c).
+  static const short plot_line_colors[MAX_LINES_PER_PLOT] = {7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
   unsigned lvl_before[MAX_LINES_PER_PLOT];
   for (size_t k = 0; k < num_lines; ++k)
     lvl_before[k] = data_level(rows, data[k], increment);
